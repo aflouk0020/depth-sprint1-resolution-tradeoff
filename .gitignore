@@ -1,0 +1,18 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Outputs (generated files)
+outputs/
+notebooks/
+
+# OS
+.DS_Store
+
+# Large weights (future checkpoints)
+*.pth
+
+# Logs
+*.log
+
