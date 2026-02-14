@@ -1,13 +1,17 @@
+#!/usr/bin/env python3
 """
 Sprint 1 - Generate All Figures for Paper/Report (US6)
 Reads outputs/tables/results_resolution_metrics.csv and outputs 4 high-res plots.
+
+Run:
+    python scripts/04_plot_all_metrics.py
 """
 
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-def main():
+def main() -> None:
     # 1. Setup Input & Output Paths
     root = Path(__file__).resolve().parents[1]
     csv_path = root / "outputs" / "tables" / "results_resolution_metrics.csv"
@@ -20,8 +24,21 @@ def main():
     print(f"Loading data from: {csv_path}")
     df = pd.read_csv(csv_path)
 
+    # Validate required columns
+    required_cols = {'resolution', 'rmse_full', 'rmse_roi', 'absrel_full', 'absrel_roi', 'fps'}
+    if not required_cols.issubset(df.columns):
+        missing = required_cols - set(df.columns)
+        raise ValueError(f"CSV missing required columns: {missing}. Found: {df.columns.tolist()}")
+
     # 2. Enforce decreasing pixel count order (High → Low)
     res_order = ["1920x1080", "1280x720", "854x480"]
+    
+    # Warn if expected resolutions are missing (protocol check)
+    existing_res = set(df['resolution'].unique())
+    missing_res = set(res_order) - existing_res
+    if missing_res:
+        print(f"⚠️ Warning: Missing expected resolutions from protocol: {missing_res}")
+
     df['resolution'] = pd.Categorical(df['resolution'], categories=res_order, ordered=True)
     df = df.sort_values('resolution')
 
@@ -43,6 +60,7 @@ def main():
     ax1.legend()
     fig1.tight_layout()
     fig1.savefig(out_dir / 'fig1_rmse_vs_resolution.png', dpi=300)
+    plt.close(fig1)
     print("✅ Generated: Figure 1 (RMSE)")
 
     # ==========================================
@@ -54,6 +72,7 @@ def main():
     ax2.legend()
     fig2.tight_layout()
     fig2.savefig(out_dir / 'fig2_absrel_vs_resolution.png', dpi=300)
+    plt.close(fig2)
     print("✅ Generated: Figure 2 (AbsRel)")
 
     # ==========================================
@@ -66,6 +85,7 @@ def main():
     ax3.legend()
     fig3.tight_layout()
     fig3.savefig(out_dir / 'fig3_fps_vs_resolution.png', dpi=300)
+    plt.close(fig3)
     print("✅ Generated: Figure 3 (FPS)")
 
     # ==========================================
@@ -90,7 +110,7 @@ def main():
     ax4b.set_ylim(0, 18)
 
     # Annotate Pareto Optimal Candidate
-    ax4a.annotate('Pareto Optimal\n(Zero Error, Max Valid FPS)', 
+    ax4a.annotate('Pareto Optimal\n(0 RMSE vs 1080p reference)', 
                  xy=(0, df['rmse_roi'].iloc[0]), 
                  xytext=(0.3, df['rmse_roi'].iloc[-1]*0.5), 
                  arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=7),
@@ -106,6 +126,7 @@ def main():
     fig4.tight_layout()
     
     fig4.savefig(out_dir / 'fig4_pareto_tradeoff.png', dpi=300)
+    plt.close(fig4)
     print("✅ Generated: Figure 4 (Pareto Trade-off)")
     print(f"\n🎉 All figures saved successfully to: {out_dir}")
 
