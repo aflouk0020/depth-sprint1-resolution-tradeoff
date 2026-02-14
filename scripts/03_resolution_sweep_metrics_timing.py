@@ -5,10 +5,13 @@ Sprint 1 - Resolution Sweep + Metrics + Timing (LOCKED, Plan-Aligned)
 Key fixes vs your previous version:
 1) Uses per-frame 1080p reference depth (D_ref) for the SAME frame and SAME model.
 2) Enforces draft scope = 3 resolutions only (1080, 720, 480) via config.
-3) Uses processed H.264 master video (per Lee) + optional SHA256 verification.
+3) Uses processed H.264 master video + SHA256 verification (if provided).
 4) Locks processor speed choice (use_fast) from YAML to avoid device mismatch.
 5) Timing = inference-only, excludes resize + video I/O, includes CUDA sync on RTX.
 6) 1080p row metrics are defined as 0.0000 (consistency vs itself).
+7) Auto-captures git commit hash for audit traceability.
+8) Prints ROI boundary values for 1080p (H=1080, W=1920) for audit clarity.
+9) Timing loop reuses preloaded tensors (no per-iteration CPU→GPU transfer).
 
 Run:
   python scripts/03_resolution_sweep_metrics_timing.py
@@ -24,6 +27,7 @@ import yaml
 import cv2
 import numpy as np
 import torch
+import subprocess
 
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
@@ -73,6 +77,17 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def get_git_commit_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root()),
+            stderr=subprocess.DEVNULL
+        ).decode("utf-8").strip()
+    except Exception:
+        return "not_available"
+
+
 def roi_mask(h: int, w: int, bottom_height_ratio: float, center_width_ratio: float) -> np.ndarray:
     # bottom 40% -> y_start = floor(0.60*H), y_end = H
     y_start = int(np.floor((1.0 - bottom_height_ratio) * h))
@@ -82,6 +97,9 @@ def roi_mask(h: int, w: int, bottom_height_ratio: float, center_width_ratio: flo
     x_margin = (1.0 - center_width_ratio) / 2.0
     x_start = int(np.floor(x_margin * w))
     x_end = int(np.floor((1.0 - x_margin) * w))
+
+    # ✅ Audit print (for 1080p reference this should print y[648:1080], x[384:1536])
+    print(f"ROI boundaries for HxW={h}x{w}: y[{y_start}:{y_end}], x[{x_start}:{x_end}]")
 
     mask = np.zeros((h, w), dtype=bool)
     mask[y_start:y_end, x_start:x_end] = True
@@ -109,19 +127,11 @@ def absrel(pred: np.ndarray, ref: np.ndarray, eps: float = 1e-6, mask: np.ndarra
 # -----------------------------
 
 @torch.inference_mode()
-def infer_depth(
-    model: AutoModelForDepthEstimation,
-    processor: AutoImageProcessor,
-    rgb_uint8: np.ndarray,
-    device: str,
-) -> np.ndarray:
+def infer_depth_from_inputs(model: AutoModelForDepthEstimation, inputs: dict, device: str) -> np.ndarray:
     """
-    rgb_uint8: HxWx3 uint8 RGB
+    inputs: already on device, already preprocessed by processor (pixel_values)
     returns: HxW float32 depth prediction in model native scale
     """
-    inputs = processor(images=rgb_uint8, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
     outputs = model(**inputs)
     depth = outputs.predicted_depth  # [1, H, W]
     depth = depth.squeeze(0).detach().float().cpu().numpy().astype(np.float32)
@@ -150,6 +160,23 @@ def load_model_and_processor(cfg: dict, device: str):
     return model, processor
 
 
+def build_device_inputs(
+    processor: AutoImageProcessor,
+    rgb_uint8_list: list[np.ndarray],
+    device: str,
+) -> list[dict]:
+    """
+    ✅ Preprocess once (CPU) and move once (CPU→GPU) for strict timing isolation.
+    Timing loop will reuse these dicts with tensors already on device.
+    """
+    device_inputs: list[dict] = []
+    for rgb in rgb_uint8_list:
+        inputs = processor(images=rgb, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        device_inputs.append(inputs)
+    return device_inputs
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -158,27 +185,29 @@ def main() -> None:
     root = repo_root()
     cfg = load_config()
 
+    git_commit = get_git_commit_hash()
+
     # Reference resolution
     ref_w, ref_h = map(int, cfg["resolutions"]["reference"])
 
-    # Master video (Lee-aligned: processed H.264)
+    # Master video
     video_path = (root / cfg["dataset"]["master_video_path"]).resolve()
     if not video_path.exists():
         raise FileNotFoundError(f"Master video not found: {video_path}")
 
-    # Optional SHA256 verification (highly recommended for Freeze 1)
+    # Optional SHA256 verification
     expected_sha = cfg["dataset"].get("expected_sha256")
+    actual_master_sha = sha256_file(video_path)
     if expected_sha:
-        actual_sha = sha256_file(video_path)
-        if actual_sha.lower() != str(expected_sha).lower():
+        if actual_master_sha.lower() != str(expected_sha).lower():
             raise RuntimeError(
                 "Master video SHA256 mismatch!\n"
                 f"Expected: {expected_sha}\n"
-                f"Actual:   {actual_sha}\n"
-                "Fix your master_video_path or expected_sha256 before any experiments."
+                f"Actual:   {actual_master_sha}\n"
+                "Fix master_video_path / expected_sha256 before any runs."
             )
 
-    # ROI mask at reference size
+    # ROI mask at reference size (H=1080, W=1920)
     roi_cfg = cfg["roi"]["definition"]
     roi = roi_mask(
         h=ref_h,
@@ -196,7 +225,7 @@ def main() -> None:
     warmup = int(cfg["timing"]["warmup_frames"])
     measure_frames = int(cfg["timing"]["measure_frames"])
 
-    # Enforce draft scope: 3 resolutions only
+    # Enforce draft scope
     test_levels = [tuple(map(int, r)) for r in cfg["resolutions"]["test_levels"]]
     allowed_draft = {(1920, 1080), (1280, 720), (854, 480)}
     if set(test_levels) != allowed_draft:
@@ -224,32 +253,37 @@ def main() -> None:
             f"Frames total: {len(frames_bgr)}, warmup: {warmup}, measure: {measure_frames}"
         )
 
-    usable = frames_bgr[warmup : warmup + measure_frames]
+    usable_bgr = frames_bgr[warmup : warmup + measure_frames]
 
-    # Device (Macbook debugging ok; RTX later for official FPS)
+    # Device selection
     device = pick_device(cfg)
     print(f"Device: {device}")
+    print("Timing protocol: ONLY model forward pass timed. No preprocessing, postprocessing, or I/O.")
+    print("Timing protocol: Same preloaded tensor list reused across timing runs (no per-iteration CPU→GPU transfer).")
+    if device == "cuda":
+        print("Timing protocol: torch.cuda.synchronize() applied before and after timing block.")
 
     model, processor = load_model_and_processor(cfg, device)
 
+    # Build reference RGB list at 1080p (no crop/trim)
+    ref_rgb_list: list[np.ndarray] = []
+    for frame_bgr in usable_bgr:
+        # Ensure reference is exactly 1920x1080 (if decoder returns weird dims)
+        if frame_bgr.shape[1] != ref_w or frame_bgr.shape[0] != ref_h:
+            frame_bgr = cv2.resize(frame_bgr, (ref_w, ref_h), interpolation=cv2.INTER_CUBIC)
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        ref_rgb_list.append(rgb)
+
+    # ✅ Precompute reference inputs ON DEVICE (not timed)
+    ref_inputs_device = build_device_inputs(processor, ref_rgb_list, device)
+
     # Precompute per-frame 1080 reference depths (NOT timed; metrics reference)
-    # This enforces the plan definition: D_ref = 1080 output of same model for same frame.
     print("\nPrecomputing per-frame 1080 reference depths (for metrics)...")
     ref_depths: list[np.ndarray] = []
-    for frame_bgr in usable:
-        # Ensure reference frame is 1920x1080 (no crop/trim)
-        if frame_bgr.shape[1] != ref_w or frame_bgr.shape[0] != ref_h:
-            frame_bgr_ref = cv2.resize(frame_bgr, (ref_w, ref_h), interpolation=cv2.INTER_CUBIC)
-        else:
-            frame_bgr_ref = frame_bgr
-
-        rgb = cv2.cvtColor(frame_bgr_ref, cv2.COLOR_BGR2RGB)
-        d_ref = infer_depth(model, processor, rgb, device)
-
-        # Ensure shape matches ref (some models output same H/W as input; but we lock)
+    for inp in ref_inputs_device:
+        d_ref = infer_depth_from_inputs(model, inp, device)
         if d_ref.shape != (ref_h, ref_w):
             d_ref = cv2.resize(d_ref, (ref_w, ref_h), interpolation=cv2.INTER_CUBIC)
-
         ref_depths.append(d_ref.astype(np.float32))
 
     # Output CSV
@@ -275,10 +309,8 @@ def main() -> None:
         "master_video_sha256",
     ]
 
-    git_commit = cfg.get("compliance", {}).get("git_commit_hash", "")
+    # If you later add a local checkpoint_path in YAML, you can hash it here.
     checkpoint_sha = cfg.get("model", {}).get("checkpoint_sha256", "")
-    master_sha = sha256_file(video_path)
-
     abs_eps = float(cfg["metrics"]["absrel_epsilon"])
 
     with results_csv.open("w", newline="", encoding="utf-8") as f:
@@ -289,18 +321,23 @@ def main() -> None:
             res_label = f"{w}x{h}"
             print(f"\n=== Running {res_label} ===")
 
+            # ✅ Precompute resized RGB frames (not timed)
+            rgb_list: list[np.ndarray] = []
+            for frame_bgr in usable_bgr:
+                resized = cv2.resize(frame_bgr, (w, h), interpolation=cv2.INTER_CUBIC)
+                rgb_list.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
+
+            # ✅ Precompute processor outputs ON DEVICE (not timed)
+            inputs_device = build_device_inputs(processor, rgb_list, device)
+
             times_ms: list[float] = []
             metrics_accum: list[tuple[float, float, float, float]] = []
 
-            for i, frame_bgr in enumerate(usable):
-                # Resize (excluded from timing)
-                resized = cv2.resize(frame_bgr, (w, h), interpolation=cv2.INTER_CUBIC)
-                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
-                # Inference-only timing (strict)
+            for i, inp in enumerate(inputs_device):
+                # ✅ Inference-only timing (strict)
                 cuda_sync_if_needed(device)
                 t0 = time.perf_counter()
-                d_pred = infer_depth(model, processor, rgb, device)
+                d_pred = infer_depth_from_inputs(model, inp, device)
                 cuda_sync_if_needed(device)
                 t1 = time.perf_counter()
 
@@ -315,20 +352,19 @@ def main() -> None:
 
                 d_ref = ref_depths[i]
 
-                # ✅ Plan requirement: 1080 row vs 1080 reference must be 0.0000 / 0.0000
-                # We define "consistency degradation relative to 1080 reference" → reference has zero degradation.
+                # Reference row has zero degradation by definition
                 if (w, h) == (ref_w, ref_h):
-                    rmse_full = 0.0
-                    rmse_roi = 0.0
-                    abs_full = 0.0
-                    abs_roi = 0.0
+                    rmse_full_v = 0.0
+                    rmse_roi_v = 0.0
+                    abs_full_v = 0.0
+                    abs_roi_v = 0.0
                 else:
-                    rmse_full = rmse(d_pred_up, d_ref, mask=None)
-                    rmse_roi = rmse(d_pred_up, d_ref, mask=roi)
-                    abs_full = absrel(d_pred_up, d_ref, eps=abs_eps, mask=None)
-                    abs_roi = absrel(d_pred_up, d_ref, eps=abs_eps, mask=roi)
+                    rmse_full_v = rmse(d_pred_up, d_ref, mask=None)
+                    rmse_roi_v = rmse(d_pred_up, d_ref, mask=roi)
+                    abs_full_v = absrel(d_pred_up, d_ref, eps=abs_eps, mask=None)
+                    abs_roi_v = absrel(d_pred_up, d_ref, eps=abs_eps, mask=roi)
 
-                metrics_accum.append((rmse_full, rmse_roi, abs_full, abs_roi))
+                metrics_accum.append((rmse_full_v, rmse_roi_v, abs_full_v, abs_roi_v))
 
             mean_ms = float(np.mean(times_ms))
             std_ms = float(np.std(times_ms))
@@ -355,8 +391,8 @@ def main() -> None:
                 "checkpoint_sha256": checkpoint_sha,
                 "model_id": cfg["model"]["model_id"],
                 "revision": cfg["model"]["revision"],
-                "frames_n": str(len(usable)),
-                "master_video_sha256": master_sha,
+                "frames_n": str(len(usable_bgr)),
+                "master_video_sha256": actual_master_sha,
             }
             writer.writerow(row)
 
@@ -367,7 +403,8 @@ def main() -> None:
     print("\n✅ Saved results CSV:", results_csv)
     print("✅ Saved ROI mask preview:", roi_mask_path)
     print("✅ Master video:", video_path)
-    print("✅ Master SHA256:", master_sha)
+    print("✅ Master SHA256:", actual_master_sha)
+    print("✅ Git commit hash:", git_commit)
     print("NOTE: Official FPS must be produced on RTX (CUDA) per Sprint plan.")
 
 
