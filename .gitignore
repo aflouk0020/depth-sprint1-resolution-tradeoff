@@ -16,3 +16,9 @@ notebooks/
 # Logs
 *.log
 
+
+# Ignore frozen reference stacks (stored in OneDrive)
+reference_depth/*.npy
+
+# Ignore local backups
+*.bak

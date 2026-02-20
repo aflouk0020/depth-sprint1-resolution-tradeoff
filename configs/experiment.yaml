@@ -78,11 +78,12 @@ roi:
   output_mask_path: "outputs/tables/roi_mask.png"
 
 reference_protocol:
-  mode: "per_frame_1080_reference"
-  upsample_to_reference_before_metrics: true
-  note: >
-    Reference depth must be generated from the SAME model,
-    SAME checkpoint, SAME frame, at 1920×1080 resolution.
+  reference_file: "reference_depth/reference_depth_1080_stack.npy"
+  reference_sha256: "e16297796e9acd0f4b86f9ced181f5a1f75cba8986368271681ea28ba973a813"
+  reference_device: "cuda"
+  warmup_frames: 10
+  measure_frames: 50
+  
 
 timing:
   warmup_frames: 10

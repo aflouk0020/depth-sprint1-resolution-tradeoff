@@ -2,12 +2,13 @@
 """
 Sprint 1 - Resolution Sweep + Metrics + Timing (LOCKED, Plan-Aligned)
 
-Key fixes vs your previous version:
-1) Uses per-frame 1080p reference depth (D_ref) for the SAME frame and SAME model.
-2) Enforces draft scope = 3 resolutions only (1080, 720, 480) via config.
+LOCKS / RULES:
+1) Uses per-frame 1080p reference depth stack (D_ref) for the SAME frame (N,H,W).
+2) Enforces draft scope = 3 resolutions only (1920x1080, 1280x720, 854x480).
 3) Uses processed H.264 master video + SHA256 verification (if provided).
 4) Locks processor speed choice (use_fast) from YAML to avoid device mismatch.
-5) Timing = inference-only, excludes resize + video I/O, includes CUDA sync on RTX.
+5) Timing = inference-only (model forward pass ONLY). Excludes resize + video I/O.
+   Includes CUDA sync on RTX.
 6) 1080p row metrics are defined as 0.0000 (consistency vs itself).
 7) Auto-captures git commit hash for audit traceability.
 8) Prints ROI boundary values for 1080p (H=1080, W=1920) for audit clarity.
@@ -98,7 +99,7 @@ def roi_mask(h: int, w: int, bottom_height_ratio: float, center_width_ratio: flo
     x_start = int(np.floor(x_margin * w))
     x_end = int(np.floor((1.0 - x_margin) * w))
 
-    # ✅ Audit print (for 1080p reference this should print y[648:1080], x[384:1536])
+    # Audit print (for 1080p reference this should print y[648:1080], x[384:1536])
     print(f"ROI boundaries for HxW={h}x{w}: y[{y_start}:{y_end}], x[{x_start}:{x_end}]")
 
     mask = np.zeros((h, w), dtype=bool)
@@ -166,14 +167,21 @@ def build_device_inputs(
     device: str,
 ) -> list[dict]:
     """
-    ✅ Preprocess once (CPU) and move once (CPU→GPU) for strict timing isolation.
+    Preprocess once (CPU) and move once (CPU→GPU) for strict timing isolation.
     Timing loop will reuse these dicts with tensors already on device.
     """
     device_inputs: list[dict] = []
-    for rgb in rgb_uint8_list:
+    for idx, rgb in enumerate(rgb_uint8_list):
         inputs = processor(images=rgb, return_tensors="pt")
+
+        # AUDIT first 2 frames only
+        if idx < 2 and "pixel_values" in inputs:
+            pv = inputs["pixel_values"]
+            print(f"[AUDIT] rgb_in={rgb.shape} -> pixel_values={tuple(pv.shape)}")
+
         inputs = {k: v.to(device) for k, v in inputs.items()}
         device_inputs.append(inputs)
+
     return device_inputs
 
 
@@ -253,7 +261,8 @@ def main() -> None:
             f"Frames total: {len(frames_bgr)}, warmup: {warmup}, measure: {measure_frames}"
         )
 
-    usable_bgr = frames_bgr[warmup : warmup + measure_frames]
+    usable_bgr = frames_bgr[warmup: warmup + measure_frames]
+    frames_n = len(usable_bgr)
 
     # Device selection
     device = pick_device(cfg)
@@ -274,17 +283,48 @@ def main() -> None:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         ref_rgb_list.append(rgb)
 
-    # ✅ Precompute reference inputs ON DEVICE (not timed)
-    ref_inputs_device = build_device_inputs(processor, ref_rgb_list, device)
+    # ✅ Reference depths come from LOCKED file (cross-sprint stable)
+    ref_rel = cfg["reference_protocol"]["reference_file"]
+    ref_path = (root / ref_rel).resolve()
+    if not ref_path.exists():
+        raise FileNotFoundError(f"Missing locked reference file: {ref_path}")
 
-    # Precompute per-frame 1080 reference depths (NOT timed; metrics reference)
-    print("\nPrecomputing per-frame 1080 reference depths (for metrics)...")
-    ref_depths: list[np.ndarray] = []
-    for inp in ref_inputs_device:
-        d_ref = infer_depth_from_inputs(model, inp, device)
-        if d_ref.shape != (ref_h, ref_w):
-            d_ref = cv2.resize(d_ref, (ref_w, ref_h), interpolation=cv2.INTER_CUBIC)
-        ref_depths.append(d_ref.astype(np.float32))
+    print(f"\nLoading LOCKED 1080 reference depths from: {ref_path}")
+    ref_stack = np.load(ref_path)
+
+    # Allow either:
+    # 1) (H, W) single reference depth map
+    # 2) (N, H, W) per-frame reference stack
+    # 3) (N, 1, H, W) (sometimes saved with a singleton channel dim)
+    if ref_stack.ndim == 4 and ref_stack.shape[1] == 1:
+        ref_stack = ref_stack[:, 0, :, :]
+
+    if ref_stack.ndim == 2:
+        # single frame reference, reuse for every frame
+        if ref_stack.shape != (ref_h, ref_w):
+            raise ValueError(
+                f"Reference HxW mismatch. Expected ({ref_h},{ref_w}), got {ref_stack.shape}"
+            )
+        ref_stack = ref_stack.astype(np.float32, copy=False)
+        ref_depths = [ref_stack for _ in range(frames_n)]
+
+    elif ref_stack.ndim == 3:
+        # per-frame stack
+        if ref_stack.shape[1] != ref_h or ref_stack.shape[2] != ref_w:
+            raise ValueError(
+                f"Reference HxW mismatch. Expected ({ref_h},{ref_w}), got ({ref_stack.shape[1]},{ref_stack.shape[2]})"
+            )
+        if ref_stack.shape[0] != frames_n:
+            raise ValueError(
+                f"Reference frame count mismatch. Expected N={frames_n}, got N={ref_stack.shape[0]}"
+            )
+        ref_stack = ref_stack.astype(np.float32, copy=False)
+        ref_depths = [ref_stack[i] for i in range(frames_n)]
+
+    else:
+        raise ValueError(
+            f"reference_depth_1080_stack.npy must be (H,W) or (N,H,W). Got shape={ref_stack.shape}"
+        )
 
     # Output CSV
     results_csv = (root / cfg["outputs"]["tables"]["results_csv"]).resolve()
@@ -309,7 +349,6 @@ def main() -> None:
         "master_video_sha256",
     ]
 
-    # If you later add a local checkpoint_path in YAML, you can hash it here.
     checkpoint_sha = cfg.get("model", {}).get("checkpoint_sha256", "")
     abs_eps = float(cfg["metrics"]["absrel_epsilon"])
 
@@ -321,20 +360,20 @@ def main() -> None:
             res_label = f"{w}x{h}"
             print(f"\n=== Running {res_label} ===")
 
-            # ✅ Precompute resized RGB frames (not timed)
+            # Precompute resized RGB frames (not timed)
             rgb_list: list[np.ndarray] = []
             for frame_bgr in usable_bgr:
                 resized = cv2.resize(frame_bgr, (w, h), interpolation=cv2.INTER_CUBIC)
                 rgb_list.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
 
-            # ✅ Precompute processor outputs ON DEVICE (not timed)
+            # Precompute processor outputs ON DEVICE (not timed)
             inputs_device = build_device_inputs(processor, rgb_list, device)
 
             times_ms: list[float] = []
             metrics_accum: list[tuple[float, float, float, float]] = []
 
             for i, inp in enumerate(inputs_device):
-                # ✅ Inference-only timing (strict)
+                # Inference-only timing (strict)
                 cuda_sync_if_needed(device)
                 t0 = time.perf_counter()
                 d_pred = infer_depth_from_inputs(model, inp, device)
