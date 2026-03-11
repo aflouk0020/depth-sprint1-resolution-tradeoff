@@ -17,7 +17,7 @@ def repo_root():
 
 
 def load_config():
-    with open(repo_root() / "configs/experiment.yaml") as f:
+    with open(repo_root() / "configs/experiment.yaml", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -273,7 +273,7 @@ def main():
 
     out_csv = root / cfg["outputs"]["tables"]["results_csv"]
 
-    with open(out_csv, "w", newline="") as f:
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
 
         writer = csv.writer(f)
 
