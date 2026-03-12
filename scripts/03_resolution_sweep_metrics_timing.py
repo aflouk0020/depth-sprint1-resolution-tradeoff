@@ -14,6 +14,17 @@ import yaml
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 
+# ------------------------------------------------------------
+# Output policy
+# ------------------------------------------------------------
+WRITE_PER_RUN_CSVS = True
+WRITE_MASTER_SUMMARY_CSV = True
+WRITE_PAPER_TABLES = True
+
+
+# ------------------------------------------------------------
+# Paths / repo helpers
+# ------------------------------------------------------------
 def repo_root():
     return Path(__file__).resolve().parents[1]
 
@@ -23,7 +34,7 @@ def load_config():
         return yaml.safe_load(f)
 
 
-def sha256_file(path):
+def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while chunk := f.read(1024 * 1024):
@@ -46,6 +57,9 @@ def get_git_short_hash():
         return "unknown"
 
 
+# ------------------------------------------------------------
+# Device helpers
+# ------------------------------------------------------------
 def pick_device(cfg):
     for d in cfg["model"]["device_priority"]:
         if d == "cuda" and torch.cuda.is_available():
@@ -66,6 +80,9 @@ def get_device_name(device):
     return "cpu"
 
 
+# ------------------------------------------------------------
+# Image / metric helpers
+# ------------------------------------------------------------
 def pad_to_multiple_of_32(rgb):
     h, w = rgb.shape[:2]
 
@@ -95,7 +112,7 @@ def crop_back(depth, shape):
 
 def build_roi_mask(h, w):
     """
-    Locked ROI from Sprint-1 / Sprint-2:
+    Locked ROI:
     bottom 40% x centre 60%
     """
     y_start = int(math.floor(0.60 * h))
@@ -125,16 +142,68 @@ def absrel(pred, ref, mask=None, eps=1e-6):
     return float(np.mean(np.abs(p - r) / (np.abs(r) + eps)))
 
 
+# ------------------------------------------------------------
+# Reference handling
+# ------------------------------------------------------------
+def get_reference_path(root: Path, label: str) -> Path:
+    """
+    Per-model frozen 1080p reference baseline.
+    """
+    mapping = {
+        "depthanything": root / "reference_depth/reference_depth_depthanything_1080_stack.npy",
+        "midasv2": root / "reference_depth/reference_depth_midasv2_1080_stack.npy",
+    }
+
+    if label not in mapping:
+        raise KeyError(f"No reference mapping defined for model label: {label}")
+
+    ref_path = mapping[label]
+    if not ref_path.exists():
+        raise FileNotFoundError(
+            f"Missing reference stack for {label}: {ref_path}\n"
+            f"Expected per-model 1080p frozen reference."
+        )
+
+    return ref_path
+
+
+def load_reference_stack(ref_path: Path, expected_h: int, expected_w: int, expected_n: int):
+    reference_stack = np.load(ref_path).astype(np.float32)
+
+    if reference_stack.ndim != 3:
+        raise ValueError(
+            f"Expected reference stack shape (N,H,W), got {reference_stack.shape}"
+        )
+
+    if reference_stack.shape[1:] != (expected_h, expected_w):
+        raise ValueError(
+            f"Reference stack spatial shape mismatch for {ref_path.name}. "
+            f"Expected ({expected_h}, {expected_w}), got {reference_stack.shape[1:]}"
+        )
+
+    if reference_stack.shape[0] != expected_n:
+        raise ValueError(
+            f"Reference stack frame count mismatch for {ref_path.name}. "
+            f"Expected {expected_n}, got {reference_stack.shape[0]}"
+        )
+
+    return reference_stack
+
+
+# ------------------------------------------------------------
+# Model loading
+# ------------------------------------------------------------
 def load_model_and_processor(spec, device):
     """
-    Keeps current working model-loading behaviour to avoid breaking your pipeline.
+    Keeps your current working behaviour to avoid breaking the pipeline.
 
-    Important:
-    - depthanything uses Hugging Face with pinned revision
-    - midasv2 currently uses torch.hub MiDaS_small as in your working script
+    depthanything:
+      - Hugging Face
+    midasv2:
+      - current torch.hub MiDaS_small path from your working setup
 
-    If later you want full model-lock alignment to qualcomm/Midas-V2 on HF,
-    that is a separate loader change.
+    If you later switch midasv2 loader to a fully pinned HF implementation,
+    that is a separate controlled change.
     """
 
     if spec["label"] == "midasv2":
@@ -198,6 +267,56 @@ def measure_inference(model, inp, label, device):
     return depth, infer_ms
 
 
+# ------------------------------------------------------------
+# CSV writers
+# ------------------------------------------------------------
+CSV_FIELDS = [
+    "model_label",
+    "architecture",
+    "resolution",
+    "mean_time_ms",
+    "std_time_ms",
+    "fps",
+    "rmse_full",
+    "rmse_roi",
+    "absrel_full",
+    "absrel_roi",
+    "device",
+    "backend",
+    "git_commit_hash",
+    "model_id",
+    "revision",
+    "frames_n",
+    "master_video_sha256",
+    "reference_depth_sha256",
+    "reference_depth_file",
+]
+
+
+def write_csv_row(path: Path, row: dict):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow(row)
+
+
+def write_master_summary_csv(path: Path, rows: list[dict]):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_table_csv(path: Path, headers: list[str], rows: list[list]):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 def main():
     root = repo_root()
     cfg = load_config()
@@ -214,23 +333,6 @@ def main():
 
     video_path = root / cfg["dataset"]["master_video_path"]
     master_video_sha256 = sha256_file(video_path)
-
-    # Locked reference stack path
-    ref_path = root / "reference_depth/reference_depth_1080_stack.npy"
-    reference_depth_sha256 = sha256_file(ref_path)
-
-    reference_stack = np.load(ref_path).astype(np.float32)
-
-    if reference_stack.ndim != 3:
-        raise ValueError(
-            f"Expected reference stack shape (N,H,W), got {reference_stack.shape}"
-        )
-
-    if reference_stack.shape[1:] != (ref_h, ref_w):
-        raise ValueError(
-            f"Reference stack spatial shape mismatch. "
-            f"Expected ({ref_h}, {ref_w}), got {reference_stack.shape[1:]}"
-        )
 
     cap = cv2.VideoCapture(str(video_path))
     frames = []
@@ -249,21 +351,20 @@ def main():
     usable = frames[warmup:warmup + measure]
 
     if len(usable) != measure:
-        raise RuntimeError(
-            f"Expected {measure} measured frames, got {len(usable)}"
-        )
+        raise RuntimeError(f"Expected {measure} measured frames, got {len(usable)}")
 
-    if reference_stack.shape[0] != len(usable):
-        raise RuntimeError(
-            f"Reference stack frame count mismatch. "
-            f"Expected {len(usable)}, got {reference_stack.shape[0]}"
-        )
+    out_csv_dir = root / "outputs/csv"
+    out_tables_dir = root / "outputs/tables"
+    out_csv_dir.mkdir(parents=True, exist_ok=True)
+    out_tables_dir.mkdir(parents=True, exist_ok=True)
 
-    out_dir = root / "outputs/csv"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    master_rows = []
 
     for spec in cfg["sprint2"]["models"]:
         label = spec["label"]
+        architecture = (
+            "transformer" if label == "depthanything" else "cnn"
+        )
 
         print("\n======================")
         print("MODEL:", label)
@@ -271,8 +372,18 @@ def main():
 
         model, processor = load_model_and_processor(spec, device)
 
+        # Per-model frozen reference
+        ref_path = get_reference_path(root, label)
+        reference_depth_sha256 = sha256_file(ref_path)
+        reference_stack = load_reference_stack(
+            ref_path,
+            expected_h=ref_h,
+            expected_w=ref_w,
+            expected_n=len(usable),
+        )
+
         for w, h in cfg["resolutions"]["test_levels"]:
-            # M1 safety skip
+            # M1 memory safeguard
             if device == "mps" and label == "depthanything" and (w, h) == (1920, 1080):
                 print("Skipping 1080p transformer on M1 due to memory limits")
                 continue
@@ -310,7 +421,7 @@ def main():
                     tensors.append(inputs)
                     shapes.append((h, w))
 
-            # Mandatory processor bypass audit
+            # Processor bypass audit
             if label == "midasv2":
                 print("inputs_shape =", tuple(tensors[0].shape))
             else:
@@ -329,7 +440,6 @@ def main():
                 if label == "midasv2":
                     depth = crop_back(depth, shapes[i])
 
-                # Upscale prediction to locked reference size
                 depth_ref_size = cv2.resize(
                     depth,
                     (ref_w, ref_h),
@@ -343,7 +453,7 @@ def main():
                 absrel_full_vals.append(absrel(depth_ref_size, ref_depth))
                 absrel_roi_vals.append(absrel(depth_ref_size, ref_depth, mask=roi_mask))
 
-            # Keep same behaviour as your working script
+            # Same timing behaviour as before: discard first measured frame from stats
             times_for_stats = times[1:] if len(times) > 1 else times
 
             mean_ms = float(np.mean(times_for_stats))
@@ -366,57 +476,106 @@ def main():
             resolution_str = f"{w}x{h}"
             frames_n = len(usable)
             run_id = f"{label}_{backend}_{resolution_str}_{frames_n}_{git_hash}"
-            out_csv = out_dir / f"s2_{run_id}.csv"
 
-            # Use config metadata if present, otherwise safe fallback
-            model_id = spec.get("model_id", label)
-            revision = spec.get("revision", "not_recorded")
+            row = {
+                "model_label": label,
+                "architecture": architecture,
+                "resolution": resolution_str,
+                "mean_time_ms": mean_ms,
+                "std_time_ms": std_ms,
+                "fps": fps,
+                "rmse_full": rmse_full_mean,
+                "rmse_roi": rmse_roi_mean,
+                "absrel_full": absrel_full_mean,
+                "absrel_roi": absrel_roi_mean,
+                "device": device_name,
+                "backend": backend,
+                "git_commit_hash": git_hash,
+                "model_id": spec.get("model_id", label),
+                "revision": spec.get("revision", "not_recorded"),
+                "frames_n": frames_n,
+                "master_video_sha256": master_video_sha256,
+                "reference_depth_sha256": reference_depth_sha256,
+                "reference_depth_file": ref_path.name,
+            }
 
-            with open(out_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=[
-                        "resolution",
-                        "mean_time_ms",
-                        "std_time_ms",
-                        "fps",
-                        "rmse_full",
-                        "rmse_roi",
-                        "absrel_full",
-                        "absrel_roi",
-                        "device",
-                        "backend",
-                        "git_commit_hash",
-                        "model_id",
-                        "revision",
-                        "frames_n",
-                        "master_video_sha256",
-                        "reference_depth_sha256",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerow(
-                    {
-                        "resolution": resolution_str,
-                        "mean_time_ms": mean_ms,
-                        "std_time_ms": std_ms,
-                        "fps": fps,
-                        "rmse_full": rmse_full_mean,
-                        "rmse_roi": rmse_roi_mean,
-                        "absrel_full": absrel_full_mean,
-                        "absrel_roi": absrel_roi_mean,
-                        "device": device_name,
-                        "backend": backend,
-                        "git_commit_hash": git_hash,
-                        "model_id": model_id,
-                        "revision": revision,
-                        "frames_n": frames_n,
-                        "master_video_sha256": master_video_sha256,
-                        "reference_depth_sha256": reference_depth_sha256,
-                    }
-                )
+            master_rows.append(row)
 
-            print("Results saved:", out_csv)
+            if WRITE_PER_RUN_CSVS:
+                out_csv = out_csv_dir / f"s2_{run_id}.csv"
+                write_csv_row(out_csv, row)
+                print("Per-run CSV saved:", out_csv)
+
+    # --------------------------------------------------------
+    # Consolidated outputs
+    # --------------------------------------------------------
+    if WRITE_MASTER_SUMMARY_CSV:
+        master_csv_path = out_tables_dir / "sprint2_master_summary.csv"
+        write_master_summary_csv(master_csv_path, master_rows)
+        print("\nMaster summary CSV saved:", master_csv_path)
+
+    if WRITE_PAPER_TABLES:
+        # Table S2-1 style: performance
+        perf_headers = [
+            "Model",
+            "Architecture",
+            "Resolution",
+            "Mean Time (ms)",
+            "Std (ms)",
+            "FPS",
+            "Frames (N)",
+            "Device",
+            "Backend",
+        ]
+        perf_rows = [
+            [
+                r["model_label"],
+                r["architecture"],
+                r["resolution"],
+                r["mean_time_ms"],
+                r["std_time_ms"],
+                r["fps"],
+                r["frames_n"],
+                r["device"],
+                r["backend"],
+            ]
+            for r in master_rows
+        ]
+        perf_path = out_tables_dir / "table_s2_1_rtx_official_cross_model_performance.csv"
+        write_table_csv(perf_path, perf_headers, perf_rows)
+        print("Performance table saved:", perf_path)
+
+        # Table S2-2 style: metrics
+        metrics_headers = [
+            "Model",
+            "Resolution",
+            "Device",
+            "RMSE (Full)",
+            "AbsRel (Full)",
+            "RMSE (ROI)",
+            "AbsRel (ROI)",
+            "Reference File",
+            "Reference SHA256",
+        ]
+        metrics_rows = [
+            [
+                r["model_label"],
+                r["resolution"],
+                r["device"],
+                r["rmse_full"],
+                r["absrel_full"],
+                r["rmse_roi"],
+                r["absrel_roi"],
+                r["reference_depth_file"],
+                r["reference_depth_sha256"],
+            ]
+            for r in master_rows
+        ]
+        metrics_path = out_tables_dir / "table_s2_2_reference_based_consistency.csv"
+        write_table_csv(metrics_path, metrics_headers, metrics_rows)
+        print("Metrics table saved:", metrics_path)
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
