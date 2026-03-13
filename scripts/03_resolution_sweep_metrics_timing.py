@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import random
 import csv
 import hashlib
 import math
@@ -11,7 +12,22 @@ import cv2
 import numpy as np
 import torch
 import yaml
+
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+# ------------------------------------------------------------
+# Determinism / reproducibility lock
+# ------------------------------------------------------------
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ------------------------------------------------------------
@@ -325,6 +341,7 @@ def main():
     backend = device
     device_name = get_device_name(device)
     git_hash = get_git_short_hash()
+    print("Seed:", SEED)
 
     print("Device:", device)
 
