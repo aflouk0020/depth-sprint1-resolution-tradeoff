@@ -126,6 +126,38 @@ def crop_back(depth, shape):
     return depth[:h, :w]
 
 
+# ------------------------------------------------------------
+# Preprocessing helpers
+# ------------------------------------------------------------
+def prepare_rgb_frame(frame, w, h):
+    resized = cv2.resize(frame, (w, h), interpolation=cv2.INTER_CUBIC)
+    return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+
+def prepare_midas_input(rgb, device):
+    padded, shape = pad_to_multiple_of_32(rgb)
+
+    tensor = (
+        torch.from_numpy(padded)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+        / 255.0
+    ).to(device)
+
+    return tensor, shape
+
+
+def prepare_depthanything_input(rgb, processor, device):
+    inputs = processor(
+        images=rgb,
+        return_tensors="pt",
+        do_resize=False,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    return inputs
+
+
 def build_roi_mask(h, w):
     """
     Locked ROI:
@@ -411,30 +443,14 @@ def main():
             shapes = []
 
             for frame in usable:
-                resized = cv2.resize(frame, (w, h), interpolation=cv2.INTER_CUBIC)
-                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+                rgb = prepare_rgb_frame(frame, w, h)
 
                 if label == "midasv2":
-                    padded, shape = pad_to_multiple_of_32(rgb)
-
-                    tensor = (
-                        torch.from_numpy(padded)
-                        .permute(2, 0, 1)
-                        .unsqueeze(0)
-                        .float()
-                        / 255.0
-                    ).to(device)
-
+                    tensor, shape = prepare_midas_input(rgb, device)
                     tensors.append(tensor)
                     shapes.append(shape)
-
                 else:
-                    inputs = processor(
-                        images=rgb,
-                        return_tensors="pt",
-                        do_resize=False,
-                    )
-                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    inputs = prepare_depthanything_input(rgb, processor, device)
                     tensors.append(inputs)
                     shapes.append((h, w))
 
