@@ -19,6 +19,7 @@ notebooks/
 
 # Ignore frozen reference stacks (stored in OneDrive)
 reference_depth/*.npy
+reference_depth/*.zip
 
 # Ignore local backups
 *.bak
