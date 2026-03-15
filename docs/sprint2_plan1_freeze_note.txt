@@ -5,7 +5,7 @@ Branch:
 feature/sprint2-architecture-comparison
 
 Repository freeze commit:
-6f2dad2
+6d1e2df
 
 Experiment execution commit recorded in final CSV rows:
 5d4afaf
