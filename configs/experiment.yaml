@@ -1,72 +1,69 @@
 # ------------------------------------------------------------
-# Sprint 1 – LOCKED Experiment Configuration (Draft Submission)
-# Project: Resolution vs Consistency Trade-off
-# Owner: Taha Aflouk (final merge + protocol lock)
+# Sprint 2 – LOCKED Experiment Configuration
+# Project: Architecture Efficiency Comparison
+# Owner: Taha Aflouk
 # ------------------------------------------------------------
 
 project:
-  name: "depth_sprint1_resolution_tradeoff"
-  sprint: "Sprint 1 (Draft – Due 22nd)"
+  name: "depth_sprint2_architecture_comparison"
+  sprint: "Sprint 2"
   objective: >
-    Quantify resolution-induced consistency degradation
-    relative to 1080p reference output while measuring
-    inference speed (FPS) under a strictly controlled protocol.
+    Compare architectural efficiency under a strictly controlled protocol by
+    evaluating inference speed and reference-based structural consistency
+    across fixed resolutions.
 
 model:
   name: "Depth-Anything-V2-Small"
   model_id: "depth-anything/Depth-Anything-V2-Small-hf"
   revision: "5426e4f0f36572d16453bbda7a8389317b1bef99"
   framework: "pytorch"
-  device_priority: ["cuda", "mps", "cpu"]     # Mac = debug, RTX = official
+  device_priority: ["cuda", "mps", "cpu"]
   precision: "fp32"
   batch_size: 1
   inference_mode: "eval"
   processor:
-    use_fast: false                           # lock to avoid fast/slow mismatch warnings
+    use_fast: false
+
+sprint2:
+  models:
+    - label: "depthanything"
+      model_id: "depth-anything/Depth-Anything-V2-Small-hf"
+      revision: "5426e4f0f36572d16453bbda7a8389317b1bef99"
+      use_fast: false
+      checkpoint_sha256: ""
+
+    - label: "midasv2"
+      model_id: "intel-isl/MiDaS"
+      revision: "MiDaS_small"
+      use_fast: false
+      checkpoint_sha256: ""
 
 dataset:
   master_video_required: true
-
   master_video_path: "data/processed/S2_Main_Approach_h264.mp4"
-
   description: "Dynamic forward-approach indoor obstacle scenario"
   camera_device: "OnePlus 13"
   expected_orientation: "landscape"
   expected_width: 1920
   expected_height: 1080
-
-  # 🔒 Integrity Lock (Processed Master File)
   expected_sha256: "acc658f11b2ab9b3c194a9ea90f517ff7c76829ca07f0ae74d6a5677ab8126cb"
-
-  # 🔒 Now Fully Locked (Validated via video_info.py)
   expected_fps: 30.0
   expected_frames: 313
   expected_duration_seconds: 10.4333
 
-  note: >
-    All lower resolutions must be generated programmatically from this master video.
-    No cropping, trimming, rotation, re-encoding, or additional recordings permitted.
-
 resolutions:
-  reference: [1920, 1080]    # width, height (landscape reference)
-
-  # 🔒 Draft scope locked (3 resolutions only)
+  reference: [1920, 1080]
   test_levels:
     - [1920, 1080]
     - [1280, 720]
     - [854, 480]
 
-  rule: "Maintain aspect ratio. Use predefined dimensions only."
-
 preprocessing:
   color_space: "RGB"
-  normalize: true
+  normalize: false
+  resize_library: "OpenCV"
   downscale_interpolation: "bicubic"
   upscale_interpolation: "bicubic"
-  resize_library: "OpenCV"
-  note: >
-    Downscaling performed on RGB frames prior to model input.
-    Upsampling to 1920×1080 performed using bicubic interpolation.
 
 roi:
   enabled: true
@@ -74,63 +71,38 @@ roi:
     type: "fixed_ratio"
     bottom_height_ratio: 0.40
     center_width_ratio: 0.60
-  purpose: "Navigation-critical safety tunnel"
   output_mask_path: "outputs/tables/roi_mask.png"
 
 reference_protocol:
-  mode: "per_frame_1080_reference"
-  upsample_to_reference_before_metrics: true
-  note: >
-    Reference depth must be generated from the SAME model,
-    SAME checkpoint, SAME frame, at 1920×1080 resolution.
+  reference_file: "reference_depth/reference_depth_1080_stack.npy"
+  reference_sha256: "e16297796e9acd0f4b86f9ced181f5a1f75cba8986368271681ea28ba973a813"
+  reference_device: "cuda"
+  warmup_frames: 10
+  measure_frames: 50
 
 timing:
   warmup_frames: 10
-  measure_frames: 50                    # N excludes warm-up frames
-  measure: "inference_only"             # excludes decoding + resizing + I/O
+  measure_frames: 50
+  measure: "inference_only"
   preload_frames_into_memory: true
   repeats_per_resolution: 1
-  official_fps_device: "cuda"           # RTX only is official FPS
+  official_fps_device: "cuda"
   real_time_threshold_fps: 15
   report:
     save_path: "outputs/tables/timing_summary.csv"
-  note: >
-    Only the model forward pass timed (no preprocessing, no postprocessing, no I/O).
-    The same tensor list is reused across timing runs (no per-iteration CPU→GPU transfer).
-    torch.cuda.synchronize() mandatory before and after timing block.
 
 metrics:
-  label_type: "reference_based_consistency"
   compute_full_frame: true
   compute_roi: true
   rmse: true
   absrel: true
   absrel_epsilon: 1e-6
-  delta_1_25: false
 
 outputs:
-  baseline:
-    depth_npy: "outputs/baseline/baseline_depth_1080.npy"
-    preview_png: "outputs/baseline/baseline_preview_1080.png"
-    timing_txt: "outputs/baseline/baseline_timing_1080.txt"
   tables:
-    results_csv: "outputs/tables/results_resolution_metrics.csv"
+    results_csv: "outputs/tables/results_architecture_comparison.csv"
     video_info_txt: "outputs/tables/video_info.txt"
-  figures:
-    dual_axis_plot: "outputs/plots/pareto_dual_axis.png"
 
 compliance:
   locked_config: true
   require_master_video_sha256_match: true
-  enforcement_policy: >
-    Any modification to model, dataset, resolution levels, interpolation method,
-    ROI definition, timing protocol, or reference protocol requires Jira update
-    and explicit team agreement.
-
-model_lock:
-  huggingface_revision_pinned: true
-  checkpoint_source: "huggingface_cached"
-  require_checkpoint_sha256_match: true
-  note: >
-    Checkpoint must be derived from pinned HuggingFace revision.
-    For strict lock, snapshot/cache exact weights locally and record SHA256.

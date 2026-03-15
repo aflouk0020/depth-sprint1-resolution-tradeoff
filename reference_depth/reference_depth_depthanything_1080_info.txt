@@ -1,0 +1,13 @@
+model_label: depthanything
+model_id: depth-anything/Depth-Anything-V2-Small-hf
+revision: 5426e4f0f36572d16453bbda7a8389317b1bef99
+device: cuda
+video_path: G:\Projects\depth-sprint1-resolution-tradeoff\data\processed\S2_Main_Approach_h264.mp4
+master_video_sha256: acc658f11b2ab9b3c194a9ea90f517ff7c76829ca07f0ae74d6a5677ab8126cb
+reference_depth_sha256: 256fff78acaabbb036a288d870df68bfce74928de5561891ed9f3f2d04574edc
+frames_n: 50
+stack_shape: (50, 1080, 1920)
+stack_dtype: float32
+preprocessing: current Sprint-2 Depth Anything path
+do_resize: False
+resize_interpolation: bicubic

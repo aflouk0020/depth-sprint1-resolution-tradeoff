@@ -1,411 +1,614 @@
 #!/usr/bin/env python3
-"""
-Sprint 1 - Resolution Sweep + Metrics + Timing (LOCKED, Plan-Aligned)
-
-Key fixes vs your previous version:
-1) Uses per-frame 1080p reference depth (D_ref) for the SAME frame and SAME model.
-2) Enforces draft scope = 3 resolutions only (1080, 720, 480) via config.
-3) Uses processed H.264 master video + SHA256 verification (if provided).
-4) Locks processor speed choice (use_fast) from YAML to avoid device mismatch.
-5) Timing = inference-only, excludes resize + video I/O, includes CUDA sync on RTX.
-6) 1080p row metrics are defined as 0.0000 (consistency vs itself).
-7) Auto-captures git commit hash for audit traceability.
-8) Prints ROI boundary values for 1080p (H=1080, W=1920) for audit clarity.
-9) Timing loop reuses preloaded tensors (no per-iteration CPU→GPU transfer).
-
-Run:
-  python scripts/03_resolution_sweep_metrics_timing.py
-"""
-
-from __future__ import annotations
 
 from pathlib import Path
+import random
 import csv
 import hashlib
+import math
+import subprocess
 import time
-import yaml
+
 import cv2
 import numpy as np
 import torch
-import subprocess
+import yaml
 
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
+# ------------------------------------------------------------
+# Determinism / reproducibility lock
+# ------------------------------------------------------------
+SEED = 42
 
-# -----------------------------
-# Helpers
-# -----------------------------
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-def repo_root() -> Path:
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ------------------------------------------------------------
+# Output policy
+# ------------------------------------------------------------
+WRITE_PER_RUN_CSVS = True
+WRITE_MASTER_SUMMARY_CSV = True
+WRITE_PAPER_TABLES = True
+
+
+# ------------------------------------------------------------
+# Paths / repo helpers
+# ------------------------------------------------------------
+def repo_root():
     return Path(__file__).resolve().parents[1]
 
 
-def load_config() -> dict:
-    cfg_path = repo_root() / "configs" / "experiment.yaml"
-    with cfg_path.open("r", encoding="utf-8") as f:
+def load_config():
+    with open(repo_root() / "configs/experiment.yaml", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def pick_device(cfg: dict) -> str:
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_git_short_hash():
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short=7", "HEAD"],
+                cwd=repo_root(),
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("utf-8")
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
+# ------------------------------------------------------------
+# Device helpers
+# ------------------------------------------------------------
+def pick_device(cfg):
     for d in cfg["model"]["device_priority"]:
         if d == "cuda" and torch.cuda.is_available():
             return "cuda"
         if d == "mps" and torch.backends.mps.is_available():
             return "mps"
-        if d == "cpu":
-            return "cpu"
     return "cpu"
 
 
-def backend_label(device: str) -> str:
-    return "CUDA" if device == "cuda" else ("MPS" if device == "mps" else "CPU")
-
-
-def cuda_sync_if_needed(device: str) -> None:
+def get_device_name(device):
     if device == "cuda":
-        torch.cuda.synchronize()
+        try:
+            return torch.cuda.get_device_name(0)
+        except Exception:
+            return "cuda"
+    if device == "mps":
+        return "Apple Silicon MPS"
+    return "cpu"
 
 
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+# ------------------------------------------------------------
+# Image / metric helpers
+# ------------------------------------------------------------
+def pad_to_multiple_of_32(rgb):
+    h, w = rgb.shape[:2]
+
+    new_h = int(np.ceil(h / 32) * 32)
+    new_w = int(np.ceil(w / 32) * 32)
+
+    pad_bottom = new_h - h
+    pad_right = new_w - w
+
+    padded = cv2.copyMakeBorder(
+        rgb,
+        0,
+        pad_bottom,
+        0,
+        pad_right,
+        cv2.BORDER_CONSTANT,
+        value=(0, 0, 0),
+    )
+
+    return padded, (h, w)
 
 
-def get_git_commit_hash() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo_root()),
-            stderr=subprocess.DEVNULL
-        ).decode("utf-8").strip()
-    except Exception:
-        return "not_available"
+def crop_back(depth, shape):
+    h, w = shape
+    return depth[:h, :w]
 
 
-def roi_mask(h: int, w: int, bottom_height_ratio: float, center_width_ratio: float) -> np.ndarray:
-    # bottom 40% -> y_start = floor(0.60*H), y_end = H
-    y_start = int(np.floor((1.0 - bottom_height_ratio) * h))
-    y_end = h
+# ------------------------------------------------------------
+# Preprocessing helpers
+# ------------------------------------------------------------
+def prepare_rgb_frame(frame, w, h):
+    resized = cv2.resize(frame, (w, h), interpolation=cv2.INTER_CUBIC)
+    return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
-    # central 60% width -> x_start=floor(0.20*W), x_end=floor(0.80*W)
-    x_margin = (1.0 - center_width_ratio) / 2.0
-    x_start = int(np.floor(x_margin * w))
-    x_end = int(np.floor((1.0 - x_margin) * w))
 
-    # ✅ Audit print (for 1080p reference this should print y[648:1080], x[384:1536])
-    print(f"ROI boundaries for HxW={h}x{w}: y[{y_start}:{y_end}], x[{x_start}:{x_end}]")
+def prepare_midas_input(rgb, device):
+    padded, shape = pad_to_multiple_of_32(rgb)
+
+    tensor = (
+        torch.from_numpy(padded)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+        / 255.0
+    ).to(device)
+
+    return tensor, shape
+
+
+def prepare_depthanything_input(rgb, processor, device):
+    inputs = processor(
+        images=rgb,
+        return_tensors="pt",
+        do_resize=False,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    return inputs
+
+
+def build_roi_mask(h, w):
+    """
+    Locked ROI:
+    bottom 40% x centre 60%
+    """
+    y_start = int(math.floor(0.60 * h))
+    x_start = int(math.floor(0.20 * w))
+    x_end = int(math.floor(0.80 * w))
 
     mask = np.zeros((h, w), dtype=bool)
-    mask[y_start:y_end, x_start:x_end] = True
+    mask[y_start:h, x_start:x_end] = True
     return mask
 
 
-def rmse(a: np.ndarray, b: np.ndarray, mask: np.ndarray | None = None) -> float:
-    diff = (a - b).astype(np.float32)
+def rmse(pred, ref, mask=None):
+    diff = pred.astype(np.float32) - ref.astype(np.float32)
     if mask is not None:
         diff = diff[mask]
     return float(np.sqrt(np.mean(diff * diff)))
 
 
-def absrel(pred: np.ndarray, ref: np.ndarray, eps: float = 1e-6, mask: np.ndarray | None = None) -> float:
-    num = np.abs(pred - ref).astype(np.float32)
-    den = (np.abs(ref).astype(np.float32) + eps)
-    val = num / den
+def absrel(pred, ref, mask=None, eps=1e-6):
+    p = pred.astype(np.float32)
+    r = ref.astype(np.float32)
+
     if mask is not None:
-        val = val[mask]
-    return float(np.mean(val))
+        p = p[mask]
+        r = r[mask]
+
+    return float(np.mean(np.abs(p - r) / (np.abs(r) + eps)))
 
 
-# -----------------------------
-# Model (locked)
-# -----------------------------
-
-@torch.inference_mode()
-def infer_depth_from_inputs(model: AutoModelForDepthEstimation, inputs: dict, device: str) -> np.ndarray:
+# ------------------------------------------------------------
+# Reference handling
+# ------------------------------------------------------------
+def get_reference_path(root: Path, label: str) -> Path:
     """
-    inputs: already on device, already preprocessed by processor (pixel_values)
-    returns: HxW float32 depth prediction in model native scale
+    Per-model frozen 1080p reference baseline.
     """
-    outputs = model(**inputs)
-    depth = outputs.predicted_depth  # [1, H, W]
-    depth = depth.squeeze(0).detach().float().cpu().numpy().astype(np.float32)
-    return depth
+    mapping = {
+        "depthanything": root / "reference_depth/reference_depth_depthanything_1080_stack.npy",
+        "midasv2": root / "reference_depth/reference_depth_midasv2_1080_stack.npy",
+    }
+
+    if label not in mapping:
+        raise KeyError(f"No reference mapping defined for model label: {label}")
+
+    ref_path = mapping[label]
+    if not ref_path.exists():
+        raise FileNotFoundError(
+            f"Missing reference stack for {label}: {ref_path}\n"
+            f"Expected per-model 1080p frozen reference."
+        )
+
+    return ref_path
 
 
-def load_model_and_processor(cfg: dict, device: str):
-    model_id = cfg["model"]["model_id"]
-    revision = cfg["model"]["revision"]
-    use_fast = bool(cfg.get("model", {}).get("processor", {}).get("use_fast", False))
+def load_reference_stack(ref_path: Path, expected_h: int, expected_w: int, expected_n: int):
+    reference_stack = np.load(ref_path).astype(np.float32)
+
+    if reference_stack.ndim != 3:
+        raise ValueError(
+            f"Expected reference stack shape (N,H,W), got {reference_stack.shape}"
+        )
+
+    if reference_stack.shape[1:] != (expected_h, expected_w):
+        raise ValueError(
+            f"Reference stack spatial shape mismatch for {ref_path.name}. "
+            f"Expected ({expected_h}, {expected_w}), got {reference_stack.shape[1:]}"
+        )
+
+    if reference_stack.shape[0] != expected_n:
+        raise ValueError(
+            f"Reference stack frame count mismatch for {ref_path.name}. "
+            f"Expected {expected_n}, got {reference_stack.shape[0]}"
+        )
+
+    return reference_stack
+
+
+# ------------------------------------------------------------
+# Model loading
+# ------------------------------------------------------------
+def load_model_and_processor(spec, device):
+    """
+    Keeps your current working behaviour to avoid breaking the pipeline.
+
+    depthanything:
+      - Hugging Face
+    midasv2:
+      - current torch.hub MiDaS_small path from your working setup
+
+    If you later switch midasv2 loader to a fully pinned HF implementation,
+    that is a separate controlled change.
+    """
+
+    if spec["label"] == "midasv2":
+        model = torch.hub.load(
+            "intel-isl/MiDaS",
+            "MiDaS_small",
+            trust_repo=True,
+        )
+        model.to(device)
+        model.eval()
+        return model, None
 
     processor = AutoImageProcessor.from_pretrained(
-        model_id,
-        revision=revision,
-        use_fast=use_fast,
+        spec["model_id"],
+        revision=spec["revision"],
+        use_fast=False,
     )
 
     model = AutoModelForDepthEstimation.from_pretrained(
-        model_id,
-        revision=revision,
-        torch_dtype=torch.float32,
+        spec["model_id"],
+        revision=spec["revision"],
     )
 
-    model.eval()
     model.to(device)
+    model.eval()
+
     return model, processor
 
 
-def build_device_inputs(
-    processor: AutoImageProcessor,
-    rgb_uint8_list: list[np.ndarray],
-    device: str,
-) -> list[dict]:
-    """
-    ✅ Preprocess once (CPU) and move once (CPU→GPU) for strict timing isolation.
-    Timing loop will reuse these dicts with tensors already on device.
-    """
-    device_inputs: list[dict] = []
-    for rgb in rgb_uint8_list:
-        inputs = processor(images=rgb, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        device_inputs.append(inputs)
-    return device_inputs
+@torch.inference_mode()
+def run_model(model, inputs, label):
+    if label == "midasv2":
+        output = model(inputs)
+        depth = output.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        return depth
+
+    outputs = model(**inputs)
+    depth = outputs.predicted_depth
+    depth = depth.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    return depth
 
 
-# -----------------------------
+def measure_inference(model, inp, label, device):
+    if device == "cuda":
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        depth = run_model(model, inp, label)
+        end.record()
+
+        torch.cuda.synchronize()
+        infer_ms = start.elapsed_time(end)
+        return depth, infer_ms
+
+    t0 = time.perf_counter()
+    depth = run_model(model, inp, label)
+    t1 = time.perf_counter()
+
+    infer_ms = (t1 - t0) * 1000.0
+    return depth, infer_ms
+
+
+# ------------------------------------------------------------
+# CSV writers
+# ------------------------------------------------------------
+CSV_FIELDS = [
+    "model_label",
+    "architecture",
+    "resolution",
+    "mean_time_ms",
+    "std_time_ms",
+    "fps",
+    "rmse_full",
+    "rmse_roi",
+    "absrel_full",
+    "absrel_roi",
+    "device",
+    "backend",
+    "git_commit_hash",
+    "model_id",
+    "revision",
+    "frames_n",
+    "master_video_sha256",
+    "reference_depth_sha256",
+    "reference_depth_file",
+]
+
+
+def write_csv_row(path: Path, row: dict):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow(row)
+
+
+def write_master_summary_csv(path: Path, rows: list[dict]):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_table_csv(path: Path, headers: list[str], rows: list[list]):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+# ------------------------------------------------------------
 # Main
-# -----------------------------
-
-def main() -> None:
+# ------------------------------------------------------------
+def main():
     root = repo_root()
     cfg = load_config()
 
-    git_commit = get_git_commit_hash()
+    device = pick_device(cfg)
+    backend = device
+    device_name = get_device_name(device)
+    git_hash = get_git_short_hash()
+    print("Seed:", SEED)
 
-    # Reference resolution
-    ref_w, ref_h = map(int, cfg["resolutions"]["reference"])
+    print("Device:", device)
 
-    # Master video
-    video_path = (root / cfg["dataset"]["master_video_path"]).resolve()
-    if not video_path.exists():
-        raise FileNotFoundError(f"Master video not found: {video_path}")
+    ref_w, ref_h = cfg["resolutions"]["reference"]
+    roi_mask = build_roi_mask(ref_h, ref_w)
 
-    # Optional SHA256 verification
-    expected_sha = cfg["dataset"].get("expected_sha256")
-    actual_master_sha = sha256_file(video_path)
-    if expected_sha:
-        if actual_master_sha.lower() != str(expected_sha).lower():
-            raise RuntimeError(
-                "Master video SHA256 mismatch!\n"
-                f"Expected: {expected_sha}\n"
-                f"Actual:   {actual_master_sha}\n"
-                "Fix master_video_path / expected_sha256 before any runs."
-            )
+    video_path = root / cfg["dataset"]["master_video_path"]
+    master_video_sha256 = sha256_file(video_path)
 
-    # ROI mask at reference size (H=1080, W=1920)
-    roi_cfg = cfg["roi"]["definition"]
-    roi = roi_mask(
-        h=ref_h,
-        w=ref_w,
-        bottom_height_ratio=float(roi_cfg["bottom_height_ratio"]),
-        center_width_ratio=float(roi_cfg["center_width_ratio"]),
-    )
-
-    # Save ROI preview
-    roi_mask_path = (root / cfg["roi"]["output_mask_path"]).resolve()
-    roi_mask_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(roi_mask_path), (roi.astype(np.uint8) * 255))
-
-    # Timing protocol
-    warmup = int(cfg["timing"]["warmup_frames"])
-    measure_frames = int(cfg["timing"]["measure_frames"])
-
-    # Enforce draft scope
-    test_levels = [tuple(map(int, r)) for r in cfg["resolutions"]["test_levels"]]
-    allowed_draft = {(1920, 1080), (1280, 720), (854, 480)}
-    if set(test_levels) != allowed_draft:
-        raise RuntimeError(
-            "Draft scope violation: test_levels must be exactly "
-            "[1920x1080, 1280x720, 854x480] for the 22nd draft."
-        )
-
-    # Read frames once (I/O excluded from timing)
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+    frames = []
 
-    frames_bgr: list[np.ndarray] = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        frames_bgr.append(frame)
+        frames.append(frame)
+
     cap.release()
 
-    if len(frames_bgr) < warmup + measure_frames:
-        raise RuntimeError(
-            f"Not enough frames for warmup+measure.\n"
-            f"Frames total: {len(frames_bgr)}, warmup: {warmup}, measure: {measure_frames}"
+    warmup = cfg["timing"]["warmup_frames"]
+    measure = cfg["timing"]["measure_frames"]
+
+    usable = frames[warmup:warmup + measure]
+
+    if len(usable) != measure:
+        raise RuntimeError(f"Expected {measure} measured frames, got {len(usable)}")
+
+    out_csv_dir = root / "outputs/csv"
+    out_tables_dir = root / "outputs/tables"
+    out_csv_dir.mkdir(parents=True, exist_ok=True)
+    out_tables_dir.mkdir(parents=True, exist_ok=True)
+
+    master_rows = []
+
+    for spec in cfg["sprint2"]["models"]:
+        label = spec["label"]
+        architecture = (
+            "transformer" if label == "depthanything" else "cnn"
         )
 
-    usable_bgr = frames_bgr[warmup : warmup + measure_frames]
+        print("\n======================")
+        print("MODEL:", label)
+        print("======================")
 
-    # Device selection
-    device = pick_device(cfg)
-    print(f"Device: {device}")
-    print("Timing protocol: ONLY model forward pass timed. No preprocessing, postprocessing, or I/O.")
-    print("Timing protocol: Same preloaded tensor list reused across timing runs (no per-iteration CPU→GPU transfer).")
-    if device == "cuda":
-        print("Timing protocol: torch.cuda.synchronize() applied before and after timing block.")
+        model, processor = load_model_and_processor(spec, device)
 
-    model, processor = load_model_and_processor(cfg, device)
+        # Per-model frozen reference
+        ref_path = get_reference_path(root, label)
+        reference_depth_sha256 = sha256_file(ref_path)
+        reference_stack = load_reference_stack(
+            ref_path,
+            expected_h=ref_h,
+            expected_w=ref_w,
+            expected_n=len(usable),
+        )
 
-    # Build reference RGB list at 1080p (no crop/trim)
-    ref_rgb_list: list[np.ndarray] = []
-    for frame_bgr in usable_bgr:
-        # Ensure reference is exactly 1920x1080 (if decoder returns weird dims)
-        if frame_bgr.shape[1] != ref_w or frame_bgr.shape[0] != ref_h:
-            frame_bgr = cv2.resize(frame_bgr, (ref_w, ref_h), interpolation=cv2.INTER_CUBIC)
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        ref_rgb_list.append(rgb)
+        for w, h in cfg["resolutions"]["test_levels"]:
+            # M1 memory safeguard
+            if device == "mps" and label == "depthanything" and (w, h) == (1920, 1080):
+                print("Skipping 1080p transformer on M1 due to memory limits")
+                continue
 
-    # ✅ Precompute reference inputs ON DEVICE (not timed)
-    ref_inputs_device = build_device_inputs(processor, ref_rgb_list, device)
+            print("\nResolution:", w, "x", h)
 
-    # Precompute per-frame 1080 reference depths (NOT timed; metrics reference)
-    print("\nPrecomputing per-frame 1080 reference depths (for metrics)...")
-    ref_depths: list[np.ndarray] = []
-    for inp in ref_inputs_device:
-        d_ref = infer_depth_from_inputs(model, inp, device)
-        if d_ref.shape != (ref_h, ref_w):
-            d_ref = cv2.resize(d_ref, (ref_w, ref_h), interpolation=cv2.INTER_CUBIC)
-        ref_depths.append(d_ref.astype(np.float32))
+            tensors = []
+            shapes = []
 
-    # Output CSV
-    results_csv = (root / cfg["outputs"]["tables"]["results_csv"]).resolve()
-    results_csv.parent.mkdir(parents=True, exist_ok=True)
+            for frame in usable:
+                rgb = prepare_rgb_frame(frame, w, h)
 
-    headers = [
-        "resolution",
-        "mean_time_ms",
-        "std_time_ms",
-        "fps",
-        "rmse_full",
-        "rmse_roi",
-        "absrel_full",
-        "absrel_roi",
-        "device",
-        "backend",
-        "git_commit_hash",
-        "checkpoint_sha256",
-        "model_id",
-        "revision",
-        "frames_n",
-        "master_video_sha256",
-    ]
-
-    # If you later add a local checkpoint_path in YAML, you can hash it here.
-    checkpoint_sha = cfg.get("model", {}).get("checkpoint_sha256", "")
-    abs_eps = float(cfg["metrics"]["absrel_epsilon"])
-
-    with results_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
-
-        for (w, h) in test_levels:
-            res_label = f"{w}x{h}"
-            print(f"\n=== Running {res_label} ===")
-
-            # ✅ Precompute resized RGB frames (not timed)
-            rgb_list: list[np.ndarray] = []
-            for frame_bgr in usable_bgr:
-                resized = cv2.resize(frame_bgr, (w, h), interpolation=cv2.INTER_CUBIC)
-                rgb_list.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
-
-            # ✅ Precompute processor outputs ON DEVICE (not timed)
-            inputs_device = build_device_inputs(processor, rgb_list, device)
-
-            times_ms: list[float] = []
-            metrics_accum: list[tuple[float, float, float, float]] = []
-
-            for i, inp in enumerate(inputs_device):
-                # ✅ Inference-only timing (strict)
-                cuda_sync_if_needed(device)
-                t0 = time.perf_counter()
-                d_pred = infer_depth_from_inputs(model, inp, device)
-                cuda_sync_if_needed(device)
-                t1 = time.perf_counter()
-
-                infer_ms = (t1 - t0) * 1000.0
-                times_ms.append(infer_ms)
-
-                # Upsample prediction to reference size (excluded from timing)
-                if d_pred.shape != (ref_h, ref_w):
-                    d_pred_up = cv2.resize(d_pred, (ref_w, ref_h), interpolation=cv2.INTER_CUBIC).astype(np.float32)
+                if label == "midasv2":
+                    tensor, shape = prepare_midas_input(rgb, device)
+                    tensors.append(tensor)
+                    shapes.append(shape)
                 else:
-                    d_pred_up = d_pred.astype(np.float32)
+                    inputs = prepare_depthanything_input(rgb, processor, device)
+                    tensors.append(inputs)
+                    shapes.append((h, w))
 
-                d_ref = ref_depths[i]
+            # Processor bypass audit
+            if label == "midasv2":
+                print("inputs_shape =", tuple(tensors[0].shape))
+            else:
+                print("inputs_shape =", tuple(tensors[0]["pixel_values"].shape))
 
-                # Reference row has zero degradation by definition
-                if (w, h) == (ref_w, ref_h):
-                    rmse_full_v = 0.0
-                    rmse_roi_v = 0.0
-                    abs_full_v = 0.0
-                    abs_roi_v = 0.0
-                else:
-                    rmse_full_v = rmse(d_pred_up, d_ref, mask=None)
-                    rmse_roi_v = rmse(d_pred_up, d_ref, mask=roi)
-                    abs_full_v = absrel(d_pred_up, d_ref, eps=abs_eps, mask=None)
-                    abs_roi_v = absrel(d_pred_up, d_ref, eps=abs_eps, mask=roi)
+            times = []
+            rmse_full_vals = []
+            rmse_roi_vals = []
+            absrel_full_vals = []
+            absrel_roi_vals = []
 
-                metrics_accum.append((rmse_full_v, rmse_roi_v, abs_full_v, abs_roi_v))
+            for i, inp in enumerate(tensors):
+                depth, infer_ms = measure_inference(model, inp, label, device)
+                times.append(infer_ms)
 
-            mean_ms = float(np.mean(times_ms))
-            std_ms = float(np.std(times_ms))
-            fps = (1000.0 / mean_ms) if mean_ms > 0 else 0.0
+                if label == "midasv2":
+                    depth = crop_back(depth, shapes[i])
 
-            m = np.array(metrics_accum, dtype=np.float32)
-            rmse_full_m = float(m[:, 0].mean())
-            rmse_roi_m = float(m[:, 1].mean())
-            abs_full_m = float(m[:, 2].mean())
-            abs_roi_m = float(m[:, 3].mean())
+                depth_ref_size = cv2.resize(
+                    depth,
+                    (ref_w, ref_h),
+                    interpolation=cv2.INTER_CUBIC,
+                ).astype(np.float32)
+
+                ref_depth = reference_stack[i]
+
+                rmse_full_vals.append(rmse(depth_ref_size, ref_depth))
+                rmse_roi_vals.append(rmse(depth_ref_size, ref_depth, mask=roi_mask))
+                absrel_full_vals.append(absrel(depth_ref_size, ref_depth))
+                absrel_roi_vals.append(absrel(depth_ref_size, ref_depth, mask=roi_mask))
+
+            # Same timing behaviour as before: discard first measured frame from stats
+            times_for_stats = times[1:] if len(times) > 1 else times
+
+            mean_ms = float(np.mean(times_for_stats))
+            std_ms = float(np.std(times_for_stats))
+            fps = 1000.0 / mean_ms
+
+            rmse_full_mean = float(np.mean(rmse_full_vals))
+            rmse_roi_mean = float(np.mean(rmse_roi_vals))
+            absrel_full_mean = float(np.mean(absrel_full_vals))
+            absrel_roi_mean = float(np.mean(absrel_roi_vals))
+
+            print("Mean Time (ms):", mean_ms)
+            print("Std Time (ms):", std_ms)
+            print("FPS:", fps)
+            print("RMSE Full:", rmse_full_mean)
+            print("RMSE ROI:", rmse_roi_mean)
+            print("AbsRel Full:", absrel_full_mean)
+            print("AbsRel ROI:", absrel_roi_mean)
+
+            resolution_str = f"{w}x{h}"
+            frames_n = len(usable)
+            run_id = f"{label}_{backend}_{resolution_str}_{frames_n}_{git_hash}"
 
             row = {
-                "resolution": res_label,
-                "mean_time_ms": f"{mean_ms:.4f}",
-                "std_time_ms": f"{std_ms:.4f}",
-                "fps": f"{fps:.4f}",
-                "rmse_full": f"{rmse_full_m:.6f}",
-                "rmse_roi": f"{rmse_roi_m:.6f}",
-                "absrel_full": f"{abs_full_m:.6f}",
-                "absrel_roi": f"{abs_roi_m:.6f}",
-                "device": device,
-                "backend": backend_label(device),
-                "git_commit_hash": git_commit,
-                "checkpoint_sha256": checkpoint_sha,
-                "model_id": cfg["model"]["model_id"],
-                "revision": cfg["model"]["revision"],
-                "frames_n": str(len(usable_bgr)),
-                "master_video_sha256": actual_master_sha,
+                "model_label": label,
+                "architecture": architecture,
+                "resolution": resolution_str,
+                "mean_time_ms": mean_ms,
+                "std_time_ms": std_ms,
+                "fps": fps,
+                "rmse_full": rmse_full_mean,
+                "rmse_roi": rmse_roi_mean,
+                "absrel_full": absrel_full_mean,
+                "absrel_roi": absrel_roi_mean,
+                "device": device_name,
+                "backend": backend,
+                "git_commit_hash": git_hash,
+                "model_id": spec.get("model_id", label),
+                "revision": spec.get("revision", "not_recorded"),
+                "frames_n": frames_n,
+                "master_video_sha256": master_video_sha256,
+                "reference_depth_sha256": reference_depth_sha256,
+                "reference_depth_file": ref_path.name,
             }
-            writer.writerow(row)
 
-            print(f"mean_time_ms={mean_ms:.2f} | fps={fps:.2f}")
-            print(f"rmse_full={rmse_full_m:.6f} | rmse_roi={rmse_roi_m:.6f}")
-            print(f"absrel_full={abs_full_m:.6f} | absrel_roi={abs_roi_m:.6f}")
+            master_rows.append(row)
 
-    print("\n✅ Saved results CSV:", results_csv)
-    print("✅ Saved ROI mask preview:", roi_mask_path)
-    print("✅ Master video:", video_path)
-    print("✅ Master SHA256:", actual_master_sha)
-    print("✅ Git commit hash:", git_commit)
-    print("NOTE: Official FPS must be produced on RTX (CUDA) per Sprint plan.")
+            if WRITE_PER_RUN_CSVS:
+                out_csv = out_csv_dir / f"s2_{run_id}.csv"
+                write_csv_row(out_csv, row)
+                print("Per-run CSV saved:", out_csv)
+
+    # --------------------------------------------------------
+    # Consolidated outputs
+    # --------------------------------------------------------
+    if WRITE_MASTER_SUMMARY_CSV:
+        master_csv_path = out_tables_dir / "sprint2_master_summary.csv"
+        write_master_summary_csv(master_csv_path, master_rows)
+        print("\nMaster summary CSV saved:", master_csv_path)
+
+    if WRITE_PAPER_TABLES:
+        # Table S2-1 style: performance
+        perf_headers = [
+            "Model",
+            "Architecture",
+            "Resolution",
+            "Mean Time (ms)",
+            "Std (ms)",
+            "FPS",
+            "Frames (N)",
+            "Device",
+            "Backend",
+        ]
+        perf_rows = [
+            [
+                r["model_label"],
+                r["architecture"],
+                r["resolution"],
+                r["mean_time_ms"],
+                r["std_time_ms"],
+                r["fps"],
+                r["frames_n"],
+                r["device"],
+                r["backend"],
+            ]
+            for r in master_rows
+        ]
+        perf_path = out_tables_dir / "table_s2_1_rtx_official_cross_model_performance.csv"
+        write_table_csv(perf_path, perf_headers, perf_rows)
+        print("Performance table saved:", perf_path)
+
+        # Table S2-2 style: metrics
+        metrics_headers = [
+            "Model",
+            "Resolution",
+            "Device",
+            "RMSE (Full)",
+            "AbsRel (Full)",
+            "RMSE (ROI)",
+            "AbsRel (ROI)",
+            "Reference File",
+            "Reference SHA256",
+        ]
+        metrics_rows = [
+            [
+                r["model_label"],
+                r["resolution"],
+                r["device"],
+                r["rmse_full"],
+                r["absrel_full"],
+                r["rmse_roi"],
+                r["absrel_roi"],
+                r["reference_depth_file"],
+                r["reference_depth_sha256"],
+            ]
+            for r in master_rows
+        ]
+        metrics_path = out_tables_dir / "table_s2_2_reference_based_consistency.csv"
+        write_table_csv(metrics_path, metrics_headers, metrics_rows)
+        print("Metrics table saved:", metrics_path)
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":

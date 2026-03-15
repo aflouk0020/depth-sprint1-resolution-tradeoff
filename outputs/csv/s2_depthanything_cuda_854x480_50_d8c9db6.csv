@@ -1,0 +1,2 @@
+resolution,mean_time_ms,std_time_ms,fps,rmse_full,rmse_roi,absrel_full,absrel_roi,device,backend,git_commit_hash,model_id,revision,frames_n,master_video_sha256,reference_depth_sha256
+854x480,147.219722202846,0.42335904558717746,6.792568176580002,0.4046409237384796,0.5868391317129135,0.08925948113203049,0.12738462880253792,NVIDIA GeForce RTX 2050,cuda,d8c9db6,depth-anything/Depth-Anything-V2-Small-hf,5426e4f0f36572d16453bbda7a8389317b1bef99,50,acc658f11b2ab9b3c194a9ea90f517ff7c76829ca07f0ae74d6a5677ab8126cb,e16297796e9acd0f4b86f9ced181f5a1f75cba8986368271681ea28ba973a813
