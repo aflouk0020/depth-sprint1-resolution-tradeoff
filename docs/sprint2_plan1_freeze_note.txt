@@ -14,37 +14,83 @@ Official performance device:
 NVIDIA GeForce RTX 2050
 backend: cuda
 
+----------------------------------------
+Model Configuration
+----------------------------------------
+
 Model A:
 depth-anything/Depth-Anything-V2-Small-hf
-revision: 5426e4f0f36572d16453bbda7a8389317b1bef99
+revision:
+5426e4f0f36572d16453bbda7a8389317b1bef99
 
 Model B:
 intel-isl/MiDaS
 execution loader: MiDaS_small
+
+Torch Hub cached source path:
+~/ .cache/torch/hub/intel-isl_MiDaS_master
+
+Torch Hub source snapshot SHA256 fingerprint:
+060c0ac137f516dd39c3dc97a6a22da6bbe4bf359c9b6cdbf1fff0f490079f4a
+
+Checkpoint:
+midas_v21_small_256.pt
+
+Checkpoint SHA256:
+70d6b9c891758c67f974a6097fb0c608c7ee67fb81ac3e5588847d5596d56fca
+
+----------------------------------------
+Dataset & Reference Baselines
+----------------------------------------
 
 Master video SHA256:
 acc658f11b2ab9b3c194a9ea90f517ff7c76829ca07f0ae74d6a5677ab8126cb
 
 Frozen transformer reference:
 reference_depth_depthanything_1080_stack.npy
+
 SHA256:
 256fff78acaabbb036a288d870df68bfce74928de5561891ed9f3f2d04574edc
 
 Frozen CNN reference:
 reference_depth_midasv2_1080_stack.npy
+
 SHA256:
 2eba4ff11794d01d53c8b7b4709e096e66ffb30122ca9ae6170fa4f0966bffcd
 
-Large .npy reference stacks are stored outside GitHub in OneDrive due to file size limits.
-The repository stores the final CSV outputs, final tables, transformer reference metadata, and transformer preview.
+----------------------------------------
+Storage & Reproducibility Notes
+----------------------------------------
 
-Freeze checks:
-- depthanything 1920x1080 row trends to zero by construction
-- midasv2 1920x1080 row trends to zero by construction
-- frames_n = 50
-- backend = cuda
-- final tables and figures must be generated from the frozen final CSV files only
+Large .npy reference stacks are stored outside GitHub in OneDrive due to file size constraints.
 
-Status:
-Sprint 2 Plan 1 is frozen for reporting and writing.
-No reruns should be performed unless a new methodological issue is discovered.
+The repository stores:
+- final CSV outputs
+- final summary tables
+- reference metadata
+- experiment configuration files
+
+MiDaS was executed via a Torch Hub cached source snapshot, which does not preserve git metadata.
+To strengthen reproducibility, both a deterministic SHA256 fingerprint of the cached source tree and the model checkpoint SHA256 have been recorded.
+
+----------------------------------------
+Protocol Lock & Validation Checks
+----------------------------------------
+
+- 1920×1080 configuration serves as the reference condition
+- RMSE and AbsRel at 1080p are zero by construction
+- frames_n = 50 (measured frames)
+- warm-up frames applied prior to timing
+- forward-pass-only timing enforced
+- preprocessing (resize, decoding, I/O) excluded from timing
+- backend = cuda (official benchmark device)
+
+All final tables and figures must be generated strictly from the frozen final CSV outputs.
+
+----------------------------------------
+Status
+----------------------------------------
+
+Sprint 2 Plan 1 is formally frozen for reporting and writing.
+
+No reruns or configuration changes are permitted unless a critical methodological issue is identified and documented.
