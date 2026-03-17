@@ -1,0 +1,25 @@
+Sprint 2 Plan 1 – MiDaS Torch Hub Provenance Record
+
+Model:
+intel-isl/MiDaS
+
+Execution loader:
+MiDaS_small
+
+Source loading method:
+torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+
+Torch Hub cached source path:
+/Users/taflouk/.cache/torch/hub/intel-isl_MiDaS_master
+
+Torch Hub source snapshot SHA256 fingerprint:
+060c0ac137f516dd39c3dc97a6a22da6bbe4bf359c9b6cdbf1fff0f490079f4a
+
+Checkpoint file:
+midas_v21_small_256.pt
+
+Checkpoint SHA256:
+70d6b9c891758c67f974a6097fb0c608c7ee67fb81ac3e5588847d5596d56fca
+
+Note:
+The local Torch Hub cache did not preserve .git metadata, so a direct repository commit hash could not be extracted from the cached snapshot. To strengthen reproducibility, the cached source tree fingerprint and checkpoint SHA256 were recorded instead.
